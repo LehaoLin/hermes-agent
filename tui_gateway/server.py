@@ -1875,6 +1875,101 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"status": "interrupted"})
 
 
+@method("session.detach")
+def _(rid, params: dict) -> dict:
+    sid = params.get("session_id", "")
+    session = _sessions.get(sid)
+    if not session:
+        return _err(rid, 4001, "session not found")
+
+    session_key = session.get("session_key", "")
+    is_running = session.get("running", False)
+
+    if is_running:
+        # Agent is mid-turn.  Snapshot pre-turn history, spawn a detached
+        # process to re-run the turn, then interrupt the in-gateway agent.
+        task_id = f"dt_{uuid.uuid4().hex[:8]}"
+
+        with session["history_lock"]:
+            history_snapshot = list(session["history"])
+
+        # Find the last user message to re-run in the detached process.
+        user_message = ""
+        for msg in reversed(history_snapshot):
+            if msg.get("role") == "user":
+                user_message = msg.get("content", "")
+                break
+
+        if not user_message:
+            return _err(rid, 4010, "no user message to detach")
+
+        agent_kwargs = _background_agent_kwargs(session["agent"], task_id)
+        # Keep the original session_id so DB writes land in the right row.
+        agent_kwargs["session_id"] = session_key
+
+        task_dir = os.path.join(_hermes_home, "detach-tasks")
+        os.makedirs(task_dir, exist_ok=True)
+
+        cfg_path = os.path.join(task_dir, f"{task_id}.json")
+        cfg = {
+            "session_key": session_key,
+            "user_message": user_message,
+            "conversation_history": history_snapshot,
+            "agent_kwargs": agent_kwargs,
+        }
+
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+
+        subprocess.Popen(
+            [sys.executable, "-m", "tui_gateway.detach_runner", task_id],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            cwd=os.getcwd(),
+            env=os.environ.copy(),
+        )
+
+        # Interrupt the in-gateway agent so it stops competing with the
+        # detached process for tool execution / file writes.
+        if hasattr(session["agent"], "interrupt"):
+            session["agent"].interrupt()
+
+        # Close the session (pops from _sessions, cleans up slash worker).
+        _sessions.pop(sid, None)
+        try:
+            from tools.approval import unregister_gateway_notify
+            unregister_gateway_notify(session_key)
+        except Exception:
+            pass
+        try:
+            worker = session.get("slash_worker")
+            if worker:
+                worker.close()
+        except Exception:
+            pass
+
+        return _ok(rid, {"running": True, "session_key": session_key, "task_id": task_id})
+
+    # Session is idle — just close it and tell the TUI to exit.
+    _sessions.pop(sid, None)
+    try:
+        from tools.approval import unregister_gateway_notify
+        unregister_gateway_notify(session_key)
+    except Exception:
+        pass
+    try:
+        worker = session.get("slash_worker")
+        if worker:
+            worker.close()
+    except Exception:
+        pass
+
+    return _ok(rid, {"running": False, "session_key": session_key})
+
+
 # ── Delegation: subagent tree observability + controls ───────────────
 # Powers the TUI's /agents overlay (see ui-tui/src/components/agentsOverlay).
 # The registry lives in tools/delegate_tool — these handlers are thin

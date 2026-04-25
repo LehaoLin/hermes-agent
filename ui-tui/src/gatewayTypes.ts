@@ -369,6 +369,12 @@ export interface SpawnTreeSaveResponse {
   session_id?: string
 }
 
+export interface DetachResponse {
+  running?: boolean
+  session_key?: string
+  task_id?: string
+}
+
 export type GatewayEvent =
   | { payload?: { skin?: GatewaySkin }; session_id?: string; type: 'gateway.ready' }
   | { payload?: GatewaySkin; session_id?: string; type: 'skin.changed' }
